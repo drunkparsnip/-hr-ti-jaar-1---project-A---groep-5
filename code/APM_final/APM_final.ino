@@ -207,29 +207,35 @@ void obstakelVermijding() {
   }
 }
 
-byte leesRFIDGetal() {
+byte leesRFIDNummerOfSpeciaal() {
   if (!mfrc522.PICC_IsNewCardPresent()) return 0;
   if (!mfrc522.PICC_ReadCardSerial()) return 0;
 
-  byte blok = 4;
   byte buffer[18];
   byte size = sizeof(buffer);
 
-  if (mfrc522.PCD_Authenticate(
-      MFRC522::PICC_CMD_MF_AUTH_KEY_A,
-      blok,
-      &key,
-      &(mfrc522.uid)) != MFRC522::STATUS_OK) return 0;
-
-  if (mfrc522.MIFARE_Read(blok, buffer, &size) != MFRC522::STATUS_OK) return 0;
+  if (mfrc522.MIFARE_Read(4, buffer, &size) != MFRC522::STATUS_OK) {
+    mfrc522.PICC_HaltA();
+    return 0;
+  }
 
   mfrc522.PICC_HaltA();
-  mfrc522.PCD_StopCrypto1();
 
-  for (byte i = 0; i < 16; i++) {
-    if (buffer[i] >= 1 && buffer[i] <= 14) return buffer[i];
+  // normaal genummerde tags
+  if (buffer[0] >= '0' && buffer[0] <= '9') {
+    byte nummer = buffer[0] - '0';
+
+    if (buffer[1] >= '0' && buffer[1] <= '9') {
+      nummer = nummer * 10 + (buffer[1] - '0');
+    }
+
+    if (nummer >= 1 && nummer <= 14) {
+      return nummer;
+    }
   }
-  return 0;
+
+  // speciaal geval, zoals tag 9
+  return 9;
 }
 
 void setup() {
