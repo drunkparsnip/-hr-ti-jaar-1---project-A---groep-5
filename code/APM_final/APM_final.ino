@@ -96,7 +96,9 @@ void setMotor(bool wiel, bool richting, uint8_t snelheid) {
         digitalWrite(inPin2, HIGH); 
       } 
       
-      analogWrite(enPin, snelheid); } }
+      analogWrite(enPin, snelheid); 
+    } 
+}
 
 // Beide motoren vooruit
 void forward(uint8_t s) {
@@ -213,29 +215,34 @@ byte leesRFIDGetal() {
   // Kaart niet leesbaar
   if (!mfrc522.PICC_ReadCardSerial()) return 0;
 
-  byte blok = 4;
+  byte pagina = 4;
   byte buffer[18];
   byte size = sizeof(buffer);
 
-  // Authenticatie
-  if (mfrc522.PCD_Authenticate(
-      MFRC522::PICC_CMD_MF_AUTH_KEY_A,
-      blok,
-      &key,
-      &(mfrc522.uid)) != MFRC522::STATUS_OK) return 0;
-
-  // Blok lezen
-  if (mfrc522.MIFARE_Read(blok, buffer, &size) != MFRC522::STATUS_OK) return 0;
+  // Ultralight gebruikt Read (geen authenticatie)
+  if (mfrc522.MIFARE_Read(pagina, buffer, &size) != MFRC522::STATUS_OK) {
+    mfrc522.PICC_HaltA();
+    return 0;
+  }
 
   // Kaart afsluiten
   mfrc522.PICC_HaltA();
-  mfrc522.PCD_StopCrypto1();
 
-  // Zoek geldig getal
-  for (byte i = 0; i < 16; i++) {
-    if (buffer[i] >= 1 && buffer[i] <= 14) {
-      return buffer[i];
-    }
+  // Decodeer ASCII tagnummer uit bytes 0 en 1
+  // Tags 1-9:  eerste byte = 0x31..0x39, tweede byte = 0x00
+  // Tags 10-14: eerste byte = 0x31, tweede byte = 0x30..0x34
+  byte b0 = buffer[0];
+  byte b1 = buffer[1];
+
+  // Tweetallig getal: "10" t/m "14" → b0='1', b1='0'..'4'
+  if (b0 == 0x31 && b1 >= 0x30 && b1 <= 0x39) {
+    byte getal = 10 + (b1 - 0x30);
+    if (getal >= 10 && getal <= 14) return getal;
+  }
+
+  // Eentallig getal: "1" t/m "9" → b0='1'..'9', b1=0x00
+  if (b0 >= 0x31 && b0 <= 0x39 && b1 == 0x00) {
+    return b0 - 0x30;
   }
 
   return 0;
