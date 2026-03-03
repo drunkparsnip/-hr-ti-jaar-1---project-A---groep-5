@@ -15,7 +15,7 @@
 // ─── Motor B (rechts) ─────────────────────────────────────────────────────────
 #define enB 33  // PWM-capable
 #define in3 32
-#define in4 16  // Was GPIO35 (input-only), verplaatst naar GPIO16
+#define in4 16
 
 // ─── Richtingen ───────────────────────────────────────────────────────────────
 #define links     0
@@ -31,8 +31,18 @@
 // ─── Bediening ────────────────────────────────────────────────────────────────
 #define start_knop          13
 #define nood_knop           12
-#define selectie_knop       15  
-#define pakket_detectie     4   
+#define selectie_knop       15
+#define pakket_detectie     4
+
+// ─── Ultrasoon sensoren ───────────────────────────────────────────────────────
+// Pins gekozen zodat ze niet overlappen met bestaande pin-definities.
+// Vrije output-capable GPIO's op ESP32: 2, 17, 21, 22
+#define trigPinL 21
+#define echoPinL 22
+#define trigPinR 17
+#define echoPinR 2
+
+#define NUM_READINGS 8
 
 // ─── LEDC PWM configuratie ────────────────────────────────────────────────────
 #define PWM_FREQ       5000
@@ -40,7 +50,7 @@
 #define LEDC_CH_A      0       // Kanaal motor A
 #define LEDC_CH_B      1       // Kanaal motor B
 
-// ─── Status machine ───────────────────────────────────────────────────────────
+// ─── main statusmachine states ────────────────────────────────────────────────
 #define wacht_op_start    0
 #define start_vooruit     1
 #define wacht_op_tag1     2
@@ -61,10 +71,10 @@ volatile unsigned long noodStopTijd = 0;
 const unsigned long noodDebounce  = 200;  // ms
 
 void IRAM_ATTR noodStopISR() {
-  unsigned long nu = millis();
-  if (nu - noodStopTijd > noodDebounce) {
+  unsigned long nu_isr = millis();
+  if (nu_isr - noodStopTijd > noodDebounce) {
     noodStopActief = true;
-    noodStopTijd   = nu;
+    noodStopTijd   = nu_isr;
   }
 }
 
@@ -75,6 +85,8 @@ byte huidigeStatus = wacht_op_start;
 byte knopTeller         = 0;
 unsigned long knopStartTijd = 0;
 const unsigned long knopTimeout = 5000;
+
+unsigned long nu;
 
 // Gekozen depot
 byte gekozenGang = 0;
@@ -87,6 +99,10 @@ const unsigned long debounceDelay = 100;
 // Edge detectie knoppen
 bool laatsteStartStatus    = HIGH;
 bool laatsteSelectieStatus = HIGH;
+
+// Ultrasoon afstand resultaten (globaal, gevuld door ping())
+float distanceL = -1;
+float distanceR = -1;
 
 // ─── PWM hulpfunctie ──────────────────────────────────────────────────────────
 void motorPWM(bool wiel, uint8_t snelheid) {
@@ -129,13 +145,10 @@ void left(uint8_t s)      { setMotor(links, achteruit,  s); setMotor(rechts, voo
 void stopMotors()         { setMotor(links, vooruit,    0); setMotor(rechts, vooruit,    0); }
 
 // ─── Noodstop verwerking ──────────────────────────────────────────────────────
-// Wordt bovenaan loop() aangeroepen.
-// De ISR zet alleen de vlag; het daadwerkelijk stoppen gebeurt hier.
 bool checkNoodKnop() {
   if (noodStopActief) {
     noodStopActief = false;
 
-    // Direct motoren uitschakelen zonder setMotor() tussenlaag
     digitalWrite(in1, LOW); digitalWrite(in2, LOW); ledcWrite(LEDC_CH_A, 0);
     digitalWrite(in3, LOW); digitalWrite(in4, LOW); ledcWrite(LEDC_CH_B, 0);
 
@@ -149,8 +162,8 @@ bool checkNoodKnop() {
 bool safetyDelay(unsigned long ms) {
   unsigned long startTijd = millis();
   while (millis() - startTijd < ms) {
-    if (noodStopActief)                 return false;  // Interrupt vlag
-    if (digitalRead(ir_achter) == HIGH) return false;  // Achter obstakel
+    if (noodStopActief)                 return false;
+    if (digitalRead(ir_achter) == HIGH) return false;
     delay(10);
   }
   return true;
@@ -161,7 +174,6 @@ void obstakelVermijding() {
   byte rechtsSensor = digitalRead(ir_rechts);
   byte linksSensor  = digitalRead(ir_links);
   byte achterSensor = digitalRead(ir_achter);
-  unsigned long nu  = millis();
 
   if (rechtsSensor && nu - lastTriggerTime > debounceDelay) {
     lastTriggerTime = nu;
@@ -213,14 +225,117 @@ byte leesRFIDGetal() {
   return 0;
 }
 
+// ─── MAD filter ───────────────────────────────────────────────────────────────
+// Filtert uitschieters uit een reeks metingen via de Median Absolute Deviation.
+// Geeft het gemiddelde terug van de metingen binnen 2.5 * MAD van de mediaan.
+float filtered_average_mad(float *readings) {
+  float sorted[NUM_READINGS];
+  for (int i = 0; i < NUM_READINGS; i++) {
+    sorted[i] = readings[i];
+  }
+
+  // Bubblesort
+  for (int i = 0; i < NUM_READINGS - 1; i++) {
+    for (int j = 0; j < NUM_READINGS - 1 - i; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        float temp  = sorted[j];
+        sorted[j]   = sorted[j + 1];
+        sorted[j + 1] = temp;
+      }
+    }
+  }
+
+  // Mediaan van 8 waarden (gemiddelde van de twee middelste)
+  float median = (sorted[3] + sorted[4]) / 2.0f;
+
+  // Bereken afwijkingen
+  for (int i = 0; i < NUM_READINGS; i++) {
+    sorted[i] = fabsf(readings[i] - median);
+  }
+
+  // Sorteer afwijkingen
+  for (int i = 0; i < NUM_READINGS - 1; i++) {
+    for (int j = 0; j < NUM_READINGS - 1 - i; j++) {
+      if (sorted[j] > sorted[j + 1]) {
+        float temp  = sorted[j];
+        sorted[j]   = sorted[j + 1];
+        sorted[j + 1] = temp;
+      }
+    }
+  }
+
+  float mad       = (sorted[3] + sorted[4]) / 2.0f;
+  float threshold = 2.5f * mad;
+  float sum       = 0;
+  int   valid     = 0;
+
+  for (int i = 0; i < NUM_READINGS; i++) {
+    if (fabsf(readings[i] - median) <= threshold) {
+      sum += readings[i];
+      valid++;
+    } else {
+      Serial.print("Uitgesloten waarde: ");
+      Serial.println(readings[i]);
+    }
+  }
+
+  return (valid > 0) ? sum / valid : median;
+}
+
+// ─── Ultrasoon ping (beide sensoren, MAD gefilterd) ───────────────────────────
+// Vult de globale variabelen distanceL en distanceR (in cm).
+// distanceL / distanceR == -1 bij onvoldoende geldige metingen.
+void ping() {
+  float readingsL[NUM_READINGS];
+  float readingsR[NUM_READINGS];
+  int   validL = 0;
+  int   validR = 0;
+
+  for (int i = 0; i < NUM_READINGS; i++) {
+    // ── Links ──
+    digitalWrite(trigPinL, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPinL, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPinL, LOW);
+
+    // pulseIn werkt op ESP32; timeout 30 ms voorkomt blokkering bij geen echo
+    unsigned long durationL = pulseIn(echoPinL, HIGH, 30000UL);
+    if (durationL > 0) {
+      readingsL[validL++] = (durationL * 0.0343f) / 2.0f;
+    }
+
+    delay(60);
+
+    // ── Rechts ──
+    digitalWrite(trigPinR, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trigPinR, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trigPinR, LOW);
+
+    unsigned long durationR = pulseIn(echoPinR, HIGH, 30000UL);
+    if (durationR > 0) {
+      readingsR[validR++] = (durationR * 0.0343f) / 2.0f;
+    }
+
+    delay(60);
+  }
+
+  // Minimaal 4 (= NUM_READINGS / 2) geldige metingen nodig voor betrouwbare MAD
+  distanceL = (validL >= NUM_READINGS / 2) ? filtered_average_mad(readingsL) : -1.0f;
+  distanceR = (validR >= NUM_READINGS / 2) ? filtered_average_mad(readingsR) : -1.0f;
+}
+
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
+  Serial.begin(115200);
 
   // Motor output pinnen
   pinMode(in1, OUTPUT);
   pinMode(in2, OUTPUT);
   pinMode(in3, OUTPUT);
-  pinMode(in4, OUTPUT);  // GPIO16 — output-capable
+  pinMode(in4, OUTPUT);
 
   // LEDC PWM kanalen koppelen aan enable-pinnen
   ledcSetup(LEDC_CH_A, PWM_FREQ, PWM_RESOLUTION);
@@ -243,6 +358,12 @@ void setup() {
   pinMode(nood_knop, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(nood_knop), noodStopISR, FALLING);
 
+  // Ultrasoon sensoren
+  pinMode(trigPinL, OUTPUT);
+  pinMode(echoPinL, INPUT);
+  pinMode(trigPinR, OUTPUT);
+  pinMode(echoPinR, INPUT);
+
   // RFID — expliciete VSPI pinnen
   SPI.begin(18, 19, 23, SS_PIN);  // SCK, MISO, MOSI, SS
   mfrc522.PCD_Init();
@@ -252,9 +373,10 @@ void setup() {
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-
   // Noodstop altijd als eerste verwerken
   if (checkNoodKnop()) return;
+
+  nu = millis();
 
   bool startNu    = digitalRead(start_knop)    == LOW;
   bool selectieNu = digitalRead(selectie_knop) == LOW;
@@ -286,15 +408,13 @@ void loop() {
       break;
 
     // ── Selectieknop telt het gewenste depot (1–6), timeout bevestigt keuze ──
-    // Elke druk op de selectieknop verhoogt de teller met 1.
-    // Na 5 seconden zonder nieuwe druk wordt de keuze bevestigd.
     case route_keuze:
       stopMotors();
 
       if (selectieNu && laatsteSelectieStatus == HIGH) {
         knopTeller++;
-        if (knopTeller > 6) knopTeller = 1;  // Wrap rond na 6
-        knopStartTijd = millis();             // Reset timeout bij elke druk
+        if (knopTeller > 6) knopTeller = 1;
+        knopStartTijd = millis();
       }
 
       if (knopTeller > 0 && millis() - knopStartTijd > knopTimeout) {

@@ -1,3 +1,0 @@
-[submodule "code/esp32 APM FINAL/lib/libs/rfid"]
-	path = code/esp32 APM FINAL/lib/libs/rfid
-	url = https://github.com/miguelbalboa/rfid.git
