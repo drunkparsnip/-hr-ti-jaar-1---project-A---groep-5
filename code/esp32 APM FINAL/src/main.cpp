@@ -3,17 +3,17 @@
 #include <MFRC522.h>
 
 // ─── RFID ─────────────────────────────────────────────────────────────────────
-// ESP32 VSPI: SCK=18, MISO=19, MOSI=23 (handled by SPI.begin())
+// ESP32 VSPI: SCK=18, MISO=19, MOSI=23 (afgehandeld door SPI.begin())
 #define SS_PIN  5
 #define RST_PIN 27
 
 // ─── Motor A (links) ──────────────────────────────────────────────────────────
-#define enA 25  // PWM-capable
+#define enA 25  // PWM-geschikt
 #define in1 26
 #define in2 14
 
 // ─── Motor B (rechts) ─────────────────────────────────────────────────────────
-#define enB 33  // PWM-capable
+#define enB 33  // PWM-geschikt
 #define in3 32
 #define in4 16
 
@@ -23,16 +23,23 @@
 #define vooruit   0
 #define achteruit 1
 
-// ─── IR Sensoren ──────────────────────────────────────────────────────────────
-#define ir_rechts 34  // Input-only pin — OK voor sensor
-#define ir_links  36  // Input-only pin — OK voor sensor
-#define ir_achter 39  // Input-only pin — OK voor sensor
+// ─── 74HC165 Shift Register ───────────────────────────────────────────────────
+#define SR_LOAD 13   // SH/LD pin  — pulse LOW om inputs vast te leggen
+#define SR_CLK   4   // klokpin
+#define SR_DATA 36   // Q7 seriële uitgang — alleen invoer GPIO
 
-// ─── Bediening ────────────────────────────────────────────────────────────────
-#define start_knop          13
-#define nood_knop           12
-#define selectie_knop       15
-#define pakket_detectie     4
+// ─── Shift register bit posities ──────────────────────────────────────────────
+// Sluit de componenten aan op de 74HC165 in deze volgorde (A=bit7 .. H=bit0)
+#define BIT_IR_RECHTS       7   // A
+#define BIT_IR_LINKS        6   // B
+#define BIT_IR_ACHTER       5   // C
+#define BIT_START_KNOP      4   // D
+#define BIT_SELECTIE_KNOP   3   // E
+#define BIT_PAKKET_DETECTIE 2   // F
+// G en H ongebruikt, verbind met GND (lees als 0)
+
+// ─── Noodknop ──────────────────────────────────
+#define nood_knop 12
 
 // ─── Ultrasoon sensoren ───────────────────────────────────────────────────────
 // Pins gekozen zodat ze niet overlappen met bestaande pin-definities.
@@ -70,13 +77,16 @@ volatile bool noodStopActief      = false;
 volatile unsigned long noodStopTijd = 0;
 const unsigned long noodDebounce  = 200;  // ms
 
-void IRAM_ATTR noodStopISR() {
-  unsigned long nu_isr = millis();
-  if (nu_isr - noodStopTijd > noodDebounce) {
-    noodStopActief = true;
-    noodStopTijd   = nu_isr;
-  }
-}
+// ruwe byte gelezen van 74HC165, elke loop bijgewerkt
+uint8_t srState = 0;
+
+// individuele booleans afgeleid van srState voor eenvoudiger gebruik
+bool sr_irRechts        = false;
+bool sr_irLinks         = false;
+bool sr_irAchter        = false;
+bool sr_startKnop       = false;   // active-low op de shift inputs
+bool sr_selectieKnop    = false;   // active-low
+bool sr_pakketDetectie  = false;   // active-low
 
 // ─── Globale variabelen ───────────────────────────────────────────────────────
 byte huidigeStatus = wacht_op_start;
@@ -104,7 +114,43 @@ bool laatsteSelectieStatus = HIGH;
 float distanceL = -1;
 float distanceR = -1;
 
-// ─── PWM hulpfunctie ──────────────────────────────────────────────────────────
+// lees de parallelle inputs van de 74HC165 en werk de booleans bij
+void readShiftInputs() {
+  // leg de inputs vast in het shiftregister
+  digitalWrite(SR_LOAD, LOW);
+  delayMicroseconds(5);
+  digitalWrite(SR_LOAD, HIGH);
+
+  // klok acht bits uit, MSB eerst (A = bit7)
+  srState = 0;
+  for (int i = 0; i < 8; ++i) {
+    srState <<= 1;
+    if (digitalRead(SR_DATA)) srState |= 1;
+    digitalWrite(SR_CLK, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(SR_CLK, LOW);
+    delayMicroseconds(1);
+  }
+
+  // werk booleans bij
+  sr_irRechts       = (srState >> BIT_IR_RECHTS) & 1;
+  sr_irLinks        = (srState >> BIT_IR_LINKS)  & 1;
+  sr_irAchter       = (srState >> BIT_IR_ACHTER) & 1;
+  // ingangen worden hoog gehouden; actieve toestand is LAAG
+  sr_startKnop      = !((srState >> BIT_START_KNOP)     & 1);
+  sr_selectieKnop   = !((srState >> BIT_SELECTIE_KNOP)  & 1);
+  sr_pakketDetectie = !((srState >> BIT_PAKKET_DETECTIE)& 1);
+}
+
+void IRAM_ATTR noodStopISR() {
+  unsigned long nu_isr = millis();
+  if (nu_isr - noodStopTijd > noodDebounce) {
+    noodStopActief = true;
+    noodStopTijd   = nu_isr;
+  }
+}
+
+// ─── PWM-hulpfunctie ──────────────────────────────────────────────────────────
 void motorPWM(bool wiel, uint8_t snelheid) {
   if (wiel == links) {
     ledcWrite(LEDC_CH_A, snelheid);
@@ -113,7 +159,7 @@ void motorPWM(bool wiel, uint8_t snelheid) {
   }
 }
 
-// ─── Motor aansturing ─────────────────────────────────────────────────────────
+// ─── Motorsturing ─────────────────────────────────────────────────────────────
 void setMotor(bool wiel, bool richting, uint8_t snelheid) {
   if (snelheid == 0) {
     if (wiel == links) {
@@ -144,7 +190,7 @@ void backwards(uint8_t s) { setMotor(links, achteruit,  s); setMotor(rechts, ach
 void left(uint8_t s)      { setMotor(links, achteruit,  s); setMotor(rechts, vooruit,    s); }
 void stopMotors()         { setMotor(links, vooruit,    0); setMotor(rechts, vooruit,    0); }
 
-// ─── Noodstop verwerking ──────────────────────────────────────────────────────
+// ─── Noodstopverwerking ──────────────────────────────────────────────────────
 bool checkNoodKnop() {
   if (noodStopActief) {
     noodStopActief = false;
@@ -163,17 +209,17 @@ bool safetyDelay(unsigned long ms) {
   unsigned long startTijd = millis();
   while (millis() - startTijd < ms) {
     if (noodStopActief)                 return false;
-    if (digitalRead(ir_achter) == HIGH) return false;
+    if (sr_irAchter) return false; // gebruik boolean van shift register
     delay(10);
   }
   return true;
 }
 
-// ─── Obstakel vermijding ──────────────────────────────────────────────────────
+// ─── Obstakelvermijding ──────────────────────────────────────────────────────
 void obstakelVermijding() {
-  byte rechtsSensor = digitalRead(ir_rechts);
-  byte linksSensor  = digitalRead(ir_links);
-  byte achterSensor = digitalRead(ir_achter);
+  bool rechtsSensor = sr_irRechts;
+  bool linksSensor  = sr_irLinks;
+  bool achterSensor = sr_irAchter;
 
   if (rechtsSensor && nu - lastTriggerTime > debounceDelay) {
     lastTriggerTime = nu;
@@ -193,7 +239,7 @@ void obstakelVermijding() {
   }
 }
 
-// ─── RFID lezen ───────────────────────────────────────────────────────────────
+// ─── RFID-lezen ───────────────────────────────────────────────────────────────
 byte leesRFIDGetal() {
   if (!mfrc522.PICC_IsNewCardPresent()) return 0;
   if (!mfrc522.PICC_ReadCardSerial())   return 0;
@@ -211,8 +257,8 @@ byte leesRFIDGetal() {
   byte b0 = buffer[0];
   byte b1 = buffer[1];
 
-  // Tags 10–14: b0='1', b1='0'..'4'
-  if (b0 == 0x31 && b1 >= 0x30 && b1 <= 0x39) {
+  // Tags 10–14: b0='1', b1='0'..'4' (decimaal)
+  if (b0 == 0x31 && b1 >= 0x30 && b1 <= 0x34) {
     byte getal = 10 + (b1 - 0x30);
     if (getal >= 10 && getal <= 14) return getal;
   }
@@ -225,7 +271,7 @@ byte leesRFIDGetal() {
   return 0;
 }
 
-// ─── MAD filter ───────────────────────────────────────────────────────────────
+// ─── MAD-filter ───────────────────────────────────────────────────────────────
 // Filtert uitschieters uit een reeks metingen via de Median Absolute Deviation.
 // Geeft het gemiddelde terug van de metingen binnen 2.5 * MAD van de mediaan.
 float filtered_average_mad(float *readings) {
@@ -282,7 +328,7 @@ float filtered_average_mad(float *readings) {
   return (valid > 0) ? sum / valid : median;
 }
 
-// ─── Ultrasoon ping (beide sensoren, MAD gefilterd) ───────────────────────────
+// ─── Ultrasoon ping (beide sensoren, MAD-gefilterd) ───────────────────────────
 // Vult de globale variabelen distanceL en distanceR (in cm).
 // distanceL / distanceR == -1 bij onvoldoende geldige metingen.
 void ping() {
@@ -331,44 +377,54 @@ void ping() {
 void setup() {
   Serial.begin(115200);
 
-  // Motor output pinnen
+  // motoruitgangspinnen
   pinMode(in1, OUTPUT);
   pinMode(in2, OUTPUT);
   pinMode(in3, OUTPUT);
   pinMode(in4, OUTPUT);
 
-  // LEDC PWM kanalen koppelen aan enable-pinnen
+  // LEDC-PWM-kanalen koppelen aan enable-pinnen
   ledcSetup(LEDC_CH_A, PWM_FREQ, PWM_RESOLUTION);
   ledcAttachPin(enA, LEDC_CH_A);
 
   ledcSetup(LEDC_CH_B, PWM_FREQ, PWM_RESOLUTION);
   ledcAttachPin(enB, LEDC_CH_B);
 
-  // IR sensoren
-  pinMode(ir_rechts, INPUT);
-  pinMode(ir_links,  INPUT);
-  pinMode(ir_achter, INPUT);
+  // shift register control pins
+  pinMode(SR_LOAD, OUTPUT);
+  pinMode(SR_CLK,  OUTPUT);
+  pinMode(SR_DATA, INPUT);
 
-  // Knoppen
-  pinMode(start_knop,      INPUT_PULLUP);
-  pinMode(selectie_knop,   INPUT_PULLUP);
-  pinMode(pakket_detectie, INPUT_PULLUP);
+  // IR-sensoren (via 74HC165)
+  // pinMode(BIT_IR_RECHTS, INPUT);
+  // pinMode(BIT_IR_LINKS,  INPUT);
+  // pinMode(BIT_IR_ACHTER, INPUT);
+
+  // knoppen (via 74HC165)
+  // pinMode(BIT_START_KNOP,      INPUT_PULLUP);
+  // pinMode(BIT_SELECTIE_KNOP,   INPUT_PULLUP);
+  // pinMode(BIT_PAKKET_DETECTIE, INPUT_PULLUP);
 
   // Noodknop als hardware interrupt (FALLING = actief laag)
   pinMode(nood_knop, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(nood_knop), noodStopISR, FALLING);
 
-  // Ultrasoon sensoren
+  // ultrasone sensoren
   pinMode(trigPinL, OUTPUT);
   pinMode(echoPinL, INPUT);
   pinMode(trigPinR, OUTPUT);
   pinMode(echoPinR, INPUT);
 
-  // RFID — expliciete VSPI pinnen
+  // RFID — expliciete SPI-pinnen
   SPI.begin(18, 19, 23, SS_PIN);  // SCK, MISO, MOSI, SS
   mfrc522.PCD_Init();
 
   for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
+}
+
+// ─── state machine ───────────────────────────────────────────────────────────────
+void handleStates(){
+
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
@@ -378,25 +434,28 @@ void loop() {
 
   nu = millis();
 
-  bool startNu    = digitalRead(start_knop)    == LOW;
-  bool selectieNu = digitalRead(selectie_knop) == LOW;
+  // lees de parallelle inputs bij elke lus iteratie
+  readShiftInputs();
+
+  bool startNu    = sr_startKnop;
+  bool selectieNu = sr_selectieKnop;
 
   switch (huidigeStatus) {
 
-    // ── Wacht tot startknop wordt ingedrukt ──────────────────────────────────
+    // ── wacht tot startknop wordt ingedrukt ──────────────────────────────────
     case wacht_op_start:
       stopMotors();
       if (startNu && laatsteStartStatus == HIGH)
         huidigeStatus = start_vooruit;
       break;
 
-    // ── Rij vooruit, ga direct naar tag 1 zoeken ─────────────────────────────
+    // ── rij vooruit, ga direct naar tag 1 zoeken ─────────────────────────────
     case start_vooruit:
       forward(200);
       huidigeStatus = wacht_op_tag1;
       break;
 
-    // ── Rij vooruit tot RFID tag 1 wordt gelezen ─────────────────────────────
+    // ── rij vooruit tot RFID-tag 1 wordt gelezen ─────────────────────────────
     case wacht_op_tag1:
       forward(200);
       if (leesRFIDGetal() == 1) {
@@ -407,7 +466,7 @@ void loop() {
       }
       break;
 
-    // ── Selectieknop telt het gewenste depot (1–6), timeout bevestigt keuze ──
+    // ── selectieknop telt het gewenste depot (1–6), timeout bevestigt keuze ──
     case route_keuze:
       stopMotors();
 
@@ -424,7 +483,7 @@ void loop() {
       }
       break;
 
-    // ── Rij met obstakel vermijding tot de RFID tag van de gekozen gang ───────
+    // ── rij met obstakelvermijding tot de RFID-tag van de gekozen gang ───────
     case zoek_gang:
       obstakelVermijding();
       if (leesRFIDGetal() == gekozenGang) {
@@ -434,7 +493,7 @@ void loop() {
       }
       break;
 
-    // ── Draai links de gang in ────────────────────────────────────────────────
+    // ── draai links de gang in ────────────────────────────────────────────────
     case draai_links:
       left(200);
       if (safetyDelay(600)) {
@@ -443,7 +502,7 @@ void loop() {
       }
       break;
 
-    // ── Rij de gang in tot doel-tag (gang + 6) ────────────────────────────────
+    // ── rij de gang in tot doel-tag (gang + 6) ────────────────────────────────
     case zoek_route_plus_6:
       forward(200);
       if (leesRFIDGetal() == doelTag) {
@@ -452,20 +511,20 @@ void loop() {
       }
       break;
 
-    // ── Stop en wacht op pakketdetectie schakelaar ────────────────────────────
+    // ── stop en wacht op pakketdetectieschakelaar ────────────────────────────
     case stop_bij_route:
       stopMotors();
-      if (digitalRead(pakket_detectie) == LOW)
+      if (digitalRead(BIT_PAKKET_DETECTIE) == LOW)
         huidigeStatus = vrij_rijden;
       break;
 
-    // ── Vrij rijden met obstakel vermijding ───────────────────────────────────
+    // ── vrij rijden met obstakelvermijding ───────────────────────────────────
     case vrij_rijden:
       obstakelVermijding();
       break;
   }
 
-  // Edge detectie opslaan voor volgende iteratie
+  // edge-detectie opslaan voor volgende iteratie
   laatsteStartStatus    = startNu;
   laatsteSelectieStatus = selectieNu;
 
