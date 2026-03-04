@@ -1,11 +1,9 @@
 #include <Arduino.h>
 #include <SPI.h>
-#include <MFRC522.h>
 
-// ─── RFID ─────────────────────────────────────────────────────────────────────
-// ESP32 VSPI: SCK=18, MISO=19, MOSI=23 (afgehandeld door SPI.begin())
-#define SS_PIN  5
-#define RST_PIN 27
+// ─── UART met ESP 2 ───────────────────────────────────────────────────────────
+#define RX_PIN 16
+#define TX_PIN 17
 
 // ─── Motor A (links) ──────────────────────────────────────────────────────────
 #define enA 25  // PWM-geschikt
@@ -39,15 +37,15 @@
 // G en H ongebruikt, verbind met GND (lees als 0)
 
 // ─── Noodknop ──────────────────────────────────
-#define nood_knop 12
+#define nood_knop 23
 
 // ─── Ultrasoon sensoren ───────────────────────────────────────────────────────
 // Pins gekozen zodat ze niet overlappen met bestaande pin-definities.
 // Vrije output-capable GPIO's op ESP32: 2, 17, 21, 22
-#define trigPinL 21
-#define echoPinL 22
-#define trigPinR 17
-#define echoPinR 2
+#define trigPinL 5
+#define echoPinL 18
+#define trigPinR 21
+#define echoPinR 22
 
 #define NUM_READINGS 8
 
@@ -58,19 +56,31 @@
 #define LEDC_CH_B      1       // Kanaal motor B
 
 // ─── main statusmachine states ────────────────────────────────────────────────
-#define wacht_op_start    0
-#define start_vooruit     1
-#define wacht_op_tag1     2
-#define route_keuze       3
-#define zoek_gang         4
-#define draai_links       5
-#define zoek_route_plus_6 6
-#define stop_bij_route    7
-#define vrij_rijden       8
+#define klaar_voor_start 0
+#define depot_selectie 1
+#define onderweg_naar_depot 2
+#define wachten_op_pakket 3
+#define wacht_met_wegrijden 4
+#define onderweg_naar_eindpunt 5
+#define op_eindpunt 6
+#define vrij_rijden 7
 
-// ─── RFID ─────────────────────────────────────────────────────────────────────
-MFRC522 mfrc522(SS_PIN, RST_PIN);
-MFRC522::MIFARE_Key key;
+// ─── driving states ───────────────────────────────────────────────────────────────
+
+// ─── Non-blocking ping state ──────────────────────────────────────────────────
+#define PING_IDLE   0
+#define PING_TRIG_L 1
+#define PING_WAIT_L 2
+#define PING_TRIG_R 3
+#define PING_WAIT_R 4
+
+// ─── Ping Variabelen ───────────────────────────────────────────────────────────────
+byte pingState             = PING_IDLE;
+unsigned long pingTimer    = 0;
+int           pingIndex    = 0;
+float readingsL[NUM_READINGS];
+float readingsR[NUM_READINGS];
+int   validL = 0, validR  = 0;
 
 // ─── Noodstop interrupt ───────────────────────────────────────────────────────
 volatile bool noodStopActief      = false;
@@ -89,10 +99,11 @@ bool sr_selectieKnop    = false;   // active-low
 bool sr_pakketDetectie  = false;   // active-low
 
 // ─── Globale variabelen ───────────────────────────────────────────────────────
-byte huidigeStatus = wacht_op_start;
+byte huidigeStatus = klaar_voor_start;
+bool statusVeranderd = false;
 
 // Routekeuze
-byte knopTeller         = 0;
+byte knopTeller = 0;
 unsigned long knopStartTijd = 0;
 const unsigned long knopTimeout = 5000;
 
@@ -100,15 +111,28 @@ unsigned long nu;
 
 // Gekozen depot
 byte gekozenGang = 0;
-byte doelTag     = 0;
 
 // Obstakel debounce
 unsigned long lastTriggerTime   = 0;
 const unsigned long debounceDelay = 100;
 
+// knopstatussen
+  bool startNu;
+  bool selectieNu;
+  bool pakketNu;
+
+  bool startIngedrukt = false;
+  bool selectieIngedrukt = false;
+  bool pakketIngedrukt = false;
+
 // Edge detectie knoppen
 bool laatsteStartStatus    = HIGH;
 bool laatsteSelectieStatus = HIGH;
+bool laatstePakketStatus  = HIGH;
+
+// paket timer variabelen
+unsigned long pakketStartTijd = 0;
+unsigned long pakketDelay = 10000; // 10 seconden
 
 // Ultrasoon afstand resultaten (globaal, gevuld door ping())
 float distanceL = -1;
@@ -198,7 +222,7 @@ bool checkNoodKnop() {
     digitalWrite(in1, LOW); digitalWrite(in2, LOW); ledcWrite(LEDC_CH_A, 0);
     digitalWrite(in3, LOW); digitalWrite(in4, LOW); ledcWrite(LEDC_CH_B, 0);
 
-    huidigeStatus = wacht_op_start;
+    huidigeStatus = klaar_voor_start;
     return true;
   }
   return false;
@@ -208,7 +232,8 @@ bool checkNoodKnop() {
 bool safetyDelay(unsigned long ms) {
   unsigned long startTijd = millis();
   while (millis() - startTijd < ms) {
-    if (noodStopActief)                 return false;
+    if (noodStopActief) return false;
+    readShiftInputs();
     if (sr_irAchter) return false; // gebruik boolean van shift register
     delay(10);
   }
@@ -237,38 +262,6 @@ void obstakelVermijding() {
   } else {
     forward(200);
   }
-}
-
-// ─── RFID-lezen ───────────────────────────────────────────────────────────────
-byte leesRFIDGetal() {
-  if (!mfrc522.PICC_IsNewCardPresent()) return 0;
-  if (!mfrc522.PICC_ReadCardSerial())   return 0;
-
-  byte pagina = 4;
-  byte buffer[18];
-  byte size = sizeof(buffer);
-
-  if (mfrc522.MIFARE_Read(pagina, buffer, &size) != MFRC522::STATUS_OK) {
-    mfrc522.PICC_HaltA();
-    return 0;
-  }
-  mfrc522.PICC_HaltA();
-
-  byte b0 = buffer[0];
-  byte b1 = buffer[1];
-
-  // Tags 10–14: b0='1', b1='0'..'4' (decimaal)
-  if (b0 == 0x31 && b1 >= 0x30 && b1 <= 0x34) {
-    byte getal = 10 + (b1 - 0x30);
-    if (getal >= 10 && getal <= 14) return getal;
-  }
-
-  // Tags 1–9: b0='1'..'9', b1=0x00
-  if (b0 >= 0x31 && b0 <= 0x39 && b1 == 0x00) {
-    return b0 - 0x30;
-  }
-
-  return 0;
 }
 
 // ─── MAD-filter ───────────────────────────────────────────────────────────────
@@ -332,45 +325,148 @@ float filtered_average_mad(float *readings) {
 // Vult de globale variabelen distanceL en distanceR (in cm).
 // distanceL / distanceR == -1 bij onvoldoende geldige metingen.
 void ping() {
-  float readingsL[NUM_READINGS];
-  float readingsR[NUM_READINGS];
-  int   validL = 0;
-  int   validR = 0;
+  unsigned long nu_ping = millis();
 
-  for (int i = 0; i < NUM_READINGS; i++) {
-    // ── Links ──
-    digitalWrite(trigPinL, LOW);
-    delayMicroseconds(2);
-    digitalWrite(trigPinL, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(trigPinL, LOW);
-
-    // pulseIn werkt op ESP32; timeout 30 ms voorkomt blokkering bij geen echo
-    unsigned long durationL = pulseIn(echoPinL, HIGH, 30000UL);
-    if (durationL > 0) {
-      readingsL[validL++] = (durationL * 0.0343f) / 2.0f;
+  if (pingState == PING_IDLE) {
+    if (pingIndex >= NUM_READINGS) {
+      distanceL = (validL >= NUM_READINGS / 2) ? filtered_average_mad(readingsL) : -1.0f;
+      distanceR = (validR >= NUM_READINGS / 2) ? filtered_average_mad(readingsR) : -1.0f;
+      pingIndex = 0;
+      validL    = 0;
+      validR    = 0;
     }
-
-    delay(60);
-
-    // ── Rechts ──
-    digitalWrite(trigPinR, LOW);
-    delayMicroseconds(2);
-    digitalWrite(trigPinR, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(trigPinR, LOW);
-
-    unsigned long durationR = pulseIn(echoPinR, HIGH, 30000UL);
-    if (durationR > 0) {
-      readingsR[validR++] = (durationR * 0.0343f) / 2.0f;
-    }
-
-    delay(60);
+    digitalWrite(trigPinL, LOW);
+    pingTimer = nu_ping;
+    pingState = PING_TRIG_L;
   }
 
-  // Minimaal 4 (= NUM_READINGS / 2) geldige metingen nodig voor betrouwbare MAD
-  distanceL = (validL >= NUM_READINGS / 2) ? filtered_average_mad(readingsL) : -1.0f;
-  distanceR = (validR >= NUM_READINGS / 2) ? filtered_average_mad(readingsR) : -1.0f;
+  else if (pingState == PING_TRIG_L) {
+    if (nu_ping - pingTimer >= 1) {
+      digitalWrite(trigPinL, HIGH);
+      pingTimer = nu_ping;
+      pingState = PING_WAIT_L;
+    }
+  }
+
+  else if (pingState == PING_WAIT_L) {
+    if (nu_ping - pingTimer >= 1) {
+      digitalWrite(trigPinL, LOW);
+      unsigned long dur = pulseIn(echoPinL, HIGH, 30000UL);
+      if (dur > 0) readingsL[validL++] = (dur * 0.0343f) / 2.0f;
+      pingTimer = nu_ping;
+      pingState = PING_TRIG_R;
+    }
+  }
+
+  else if (pingState == PING_TRIG_R) {
+    if (nu_ping - pingTimer >= 60) {
+      digitalWrite(trigPinR, LOW);
+      pingTimer = nu_ping;
+      pingState = PING_WAIT_R;
+    }
+  }
+
+  else if (pingState == PING_WAIT_R) {
+    if (nu_ping - pingTimer >= 1) {
+      digitalWrite(trigPinR, HIGH);
+      delayMicroseconds(10);
+      digitalWrite(trigPinR, LOW);
+      unsigned long dur = pulseIn(echoPinR, HIGH, 30000UL);
+      if (dur > 0) readingsR[validR++] = (dur * 0.0343f) / 2.0f;
+      pingIndex++;
+      pingTimer = nu_ping;
+      pingState = PING_IDLE;
+    }
+  }
+}
+
+// second mcu led control 
+void serialLedControl(int8_t setColour) {
+  // status sturen voor LED
+  if (setColour == -1){
+    Serial2.write(0xFF);
+    Serial2.write(huidigeStatus);
+  }
+  else {
+    Serial2.print("led_colour: ");
+    Serial2.println(setColour);
+  }
+}
+// ─── state machine ───────────────────────────────────────────────────────────────
+void handleStates(){
+    switch (huidigeStatus) {
+
+      case klaar_voor_start:
+        if (startIngedrukt){
+          huidigeStatus = vrij_rijden;
+          statusVeranderd = true;
+        }
+        else if (selectieIngedrukt){
+          huidigeStatus = depot_selectie;
+          statusVeranderd = true;
+        }
+      break;
+
+      case depot_selectie:
+        if (statusVeranderd){
+          serialLedControl(gekozenGang);
+        }
+
+        else if (selectieIngedrukt){
+          if (gekozenGang < 7){
+            gekozenGang++;
+          }
+          else {
+            gekozenGang = 2;
+          }
+        }
+        else if (startIngedrukt){
+          huidigeStatus = onderweg_naar_depot;
+          statusVeranderd = true;
+        }
+      break;
+
+      case onderweg_naar_depot:
+      // code hier
+      statusVeranderd = true;
+      break;
+      
+      case wachten_op_pakket:
+        if (pakketIngedrukt){
+          huidigeStatus = wacht_met_wegrijden;
+          statusVeranderd = true;
+        }
+      break;
+
+      case wacht_met_wegrijden:
+        if (pakketNu) {
+          if (startIngedrukt){
+            huidigeStatus = onderweg_naar_eindpunt;
+            statusVeranderd = true;
+          }
+        }
+        else {
+          huidigeStatus = wachten_op_pakket;
+          statusVeranderd = true;
+        }
+      break;
+
+      case onderweg_naar_eindpunt:
+      // code hier
+      statusVeranderd = true;
+      break;
+
+      case op_eindpunt:
+      // code hier
+      statusVeranderd = true;
+      break;
+
+      case vrij_rijden:
+      // code hier
+      statusVeranderd = true;
+      break;
+
+  }
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
@@ -414,17 +510,6 @@ void setup() {
   pinMode(echoPinL, INPUT);
   pinMode(trigPinR, OUTPUT);
   pinMode(echoPinR, INPUT);
-
-  // RFID — expliciete SPI-pinnen
-  SPI.begin(18, 19, 23, SS_PIN);  // SCK, MISO, MOSI, SS
-  mfrc522.PCD_Init();
-
-  for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
-}
-
-// ─── state machine ───────────────────────────────────────────────────────────────
-void handleStates(){
-
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
@@ -436,97 +521,42 @@ void loop() {
 
   // lees de parallelle inputs bij elke lus iteratie
   readShiftInputs();
+  ping();
 
-  bool startNu    = sr_startKnop;
-  bool selectieNu = sr_selectieKnop;
+  startNu    = sr_startKnop;
+  selectieNu = sr_selectieKnop;
+  pakketNu    = sr_pakketDetectie;
 
-  switch (huidigeStatus) {
-
-    // ── wacht tot startknop wordt ingedrukt ──────────────────────────────────
-    case wacht_op_start:
-      stopMotors();
-      if (startNu && laatsteStartStatus == HIGH)
-        huidigeStatus = start_vooruit;
-      break;
-
-    // ── rij vooruit, ga direct naar tag 1 zoeken ─────────────────────────────
-    case start_vooruit:
-      forward(200);
-      huidigeStatus = wacht_op_tag1;
-      break;
-
-    // ── rij vooruit tot RFID-tag 1 wordt gelezen ─────────────────────────────
-    case wacht_op_tag1:
-      forward(200);
-      if (leesRFIDGetal() == 1) {
-        stopMotors();
-        knopTeller    = 0;
-        knopStartTijd = millis();
-        huidigeStatus = route_keuze;
-      }
-      break;
-
-    // ── selectieknop telt het gewenste depot (1–6), timeout bevestigt keuze ──
-    case route_keuze:
-      stopMotors();
-
-      if (selectieNu && laatsteSelectieStatus == HIGH) {
-        knopTeller++;
-        if (knopTeller > 6) knopTeller = 1;
-        knopStartTijd = millis();
-      }
-
-      if (knopTeller > 0 && millis() - knopStartTijd > knopTimeout) {
-        gekozenGang   = knopTeller + 1;
-        doelTag       = gekozenGang + 6;
-        huidigeStatus = zoek_gang;
-      }
-      break;
-
-    // ── rij met obstakelvermijding tot de RFID-tag van de gekozen gang ───────
-    case zoek_gang:
-      obstakelVermijding();
-      if (leesRFIDGetal() == gekozenGang) {
-        stopMotors();
-        delay(500);
-        huidigeStatus = draai_links;
-      }
-      break;
-
-    // ── draai links de gang in ────────────────────────────────────────────────
-    case draai_links:
-      left(200);
-      if (safetyDelay(600)) {
-        stopMotors();
-        huidigeStatus = zoek_route_plus_6;
-      }
-      break;
-
-    // ── rij de gang in tot doel-tag (gang + 6) ────────────────────────────────
-    case zoek_route_plus_6:
-      forward(200);
-      if (leesRFIDGetal() == doelTag) {
-        stopMotors();
-        huidigeStatus = stop_bij_route;
-      }
-      break;
-
-    // ── stop en wacht op pakketdetectieschakelaar ────────────────────────────
-    case stop_bij_route:
-      stopMotors();
-      if (digitalRead(BIT_PAKKET_DETECTIE) == LOW)
-        huidigeStatus = vrij_rijden;
-      break;
-
-    // ── vrij rijden met obstakelvermijding ───────────────────────────────────
-    case vrij_rijden:
-      obstakelVermijding();
-      break;
+  if (startNu && laatsteStartStatus == HIGH) {
+    startIngedrukt = true;
   }
-
+  else {
+    startIngedrukt = false;
+  }
+  if (selectieNu && laatsteSelectieStatus == HIGH) {
+    selectieIngedrukt = true;
+  }
+  else {
+    selectieIngedrukt = false;
+  }
+  if (pakketNu && laatstePakketStatus == HIGH) {
+    pakketIngedrukt = true;
+  }
+  else {
+    pakketIngedrukt = false;
+  }
+  
+  // update led controler
+   if (statusVeranderd) {
+    serialLedControl(huidigeStatus);
+  }
   // edge-detectie opslaan voor volgende iteratie
   laatsteStartStatus    = startNu;
   laatsteSelectieStatus = selectieNu;
+  laatstePakketStatus = pakketNu;
+
+  // statusmachine verandering updaten
+  statusVeranderd = false;
 
   delay(10);
 }
