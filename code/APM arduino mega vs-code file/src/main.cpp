@@ -2,6 +2,8 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
+
+// ----------------------- PIN NUMBER DEFINES -------------------------------------
 // Motor A (links) 
 #define enA 11 // PWM-geschikt
 #define in1 5
@@ -38,13 +40,14 @@
 #define GROEN_PIN 26 
 #define BLAUW_PIN 27
 
+// ----------------------------------- READABILITY DEFINES -------------------------------------
 // Richtingen 
 #define links     0
 #define rechts    1
 #define vooruit   0
 #define achteruit 1
 
-#define NUM_READINGS 8
+#define NUM_READINGS 4
 
 // main statusmachine states 
 #define klaar_voor_start 0
@@ -57,33 +60,24 @@
 #define vrij_rijden 7
 
 // driving states 
-#define ForewardRijsnelheid 255
-#define ReverseRijsnelheid 100
+#define ForwardRijsnelheid 255
+#define ReverseRijsnelheid 150
 #define clear 0
 #define rightDodge 1
 #define leftDodge 2
 #define backDodge 3
 
-// Non-blocking ping state 
-// #define PING_IDLE   0
-// #define PING_TRIG_L 1
-// #define PING_WAIT_L 2
-// #define PING_TRIG_R 3
-// #define PING_WAIT_R 4
+// NOODSTOP_PAUZE
+#define NOODSTOP_PAUZE 8
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
-// Ping Variabelen 
-byte pingState             = PING_IDLE;
-unsigned long pingTimer    = 0;
-int           pingIndex    = 0;
-float readingsL[NUM_READINGS];
-float readingsR[NUM_READINGS];
-int   validL = 0, validR  = 0;
+// -------------------------------- VARIABELEN --------------------------------------
 
 
 // Noodstop interrupt 
 volatile bool noodStopActief      = false;
+volatile bool forwardsOveride = false; 
 volatile unsigned long noodStopTijd = 0;
 const unsigned long noodDebounce  = 200;  // ms
 
@@ -91,11 +85,16 @@ const unsigned long noodDebounce  = 200;  // ms
 // Globale variabelen 
 byte huidigeStatus = klaar_voor_start;
 bool statusVeranderd = false;
+bool pakketGeplaatst = false;
+bool gangGevonden = false;
+bool depotGevonden = false;
 
 // Routekeuze
 byte knopTeller = 0;
 unsigned long knopStartTijd = 0;
 const unsigned long knopTimeout = 5000;
+unsigned long laatsteKnopTijd = 0;
+const unsigned long knopDebounce = 50; // ms
 
 unsigned long nu;
 
@@ -107,38 +106,39 @@ bool PingAanDeBeurt = links;
 
 
 // Gekozen depot
-byte gekozenGang = 0;
+byte gekozenGang = 2;
 
 // Obstakel debounce
 unsigned long laatsteHitTijd   = 0;
-const unsigned long debounceDelay = 100;
+const unsigned long obstakelDebounceDelay = 100;
 
-// knopstatussen
-  bool startNu;
-  bool selectieNu;
-  bool pakketNu;
+// knopstatus
+bool selectieNu;  
+bool selectieIngedrukt = false;
 
-  bool startIngedrukt = false;
-  bool selectieIngedrukt = false;
-  bool pakketIngedrukt = false;
-
-// Edge detectie knoppen
-bool laatsteStartStatus    = HIGH;
+// Edge detectie knop
 bool laatsteSelectieStatus = HIGH;
-bool laatstePakketStatus  = HIGH;
-
-// paket timer variabelen
-unsigned long pakketStartTijd = 0;
-unsigned long pakketDelay = 10000; // 10 seconden
-
+const uint8_t selectieDebounceDelay = 100;
+unsigned long selectieDebounceTime = 0;
 // Ultrasoon afstand resultaten (globaal, gevuld door ping())
 float distanceL = -1;
 float distanceR = -1;
 
 // kleur enum
-enum Kleur {rood, blauw, groen, geel, cyaan, paars, wit, knipperen};
+enum Kleur {rood, blauw, groen, geel, cyaan, paars, wit};
+bool 
+  ledR = 0, 
+  ledG = 0, 
+  ledB= 0;
+bool kleurupdate = false;
+uint8_t ledKnipper = 0;
 
+unsigned long ledKnipperTijd = 0;
+const uint16_t slowLedKnipperDelay = 500;
+const uint16_t fastLedKnipperDelay = 200;
+bool ledKnipperToggle = 0;
 
+// ----------------------- MOTOR FUNCTIES -----------------------------------------------------
 void setMotor(bool wiel, bool richting, uint8_t snelheid) {
   uint8_t inPin1, inPin2, enPin;
   
@@ -168,95 +168,113 @@ void setMotor(bool wiel, bool richting, uint8_t snelheid) {
   }
 }
 
+// functies van de motortoestanden 
 void forward(uint8_t s)   { setMotor(links, vooruit,    s); setMotor(rechts, vooruit,    s); }
 void backwards(uint8_t s) { setMotor(links, achteruit,  s); setMotor(rechts, achteruit,  s); }
 void left(uint8_t s)      { setMotor(links, achteruit,  s); setMotor(rechts, vooruit,    s); }
 void right(uint8_t s)     { setMotor(links, vooruit,    s); setMotor(rechts, achteruit,  s); }
 void stopMotors()         { setMotor(links, vooruit,    0); setMotor(rechts, vooruit,    0); }
 
+// --------------------- MULTICOLOR LED FUNCTIONS --------------------------------------------
 void setColor(bool redValue, bool greenValue,  bool blueValue) {
   digitalWrite(ROOD_PIN, redValue);
   digitalWrite(GROEN_PIN, greenValue);
   digitalWrite(BLAUW_PIN, blueValue);
 }
 
-void rgbLED(Kleur kleur) {
+// functie om de led te laten knipperen 
+void updateColor() {
+  if (ledKnipper != 0) {
+    uint16_t knipperDelay = ledKnipper == 1 ? fastLedKnipperDelay : slowLedKnipperDelay;
+    if (ledKnipperTijd < nu && ledKnipperToggle == 0) {
+      setColor(ledR, ledG, ledB);
+      ledKnipperToggle = 1;
+      ledKnipperTijd = nu + knipperDelay;
+    }
+
+    else if (ledKnipperTijd < nu && ledKnipperToggle == 1) {
+      setColor(1, 1, 1);
+      ledKnipperToggle = 0;
+      ledKnipperTijd = nu + knipperDelay;
+    }
+  }
+
+  else if (kleurupdate) {
+    setColor(ledR, ledG, ledB);
+    kleurupdate = false;
+  }
+}
+
+// stuurt de LED aan met kleur en wel of niet knipperen
+void rgbLED(Kleur kleur, uint8_t knipper) {
   switch (kleur) {
     case rood:
-      setColor(0, 1, 1);
+      ledR = 0;
+      ledG = 1;
+      ledB = 1;
+      //setColor(0, 1, 1);
       break;
 
     case groen:
-      setColor(1, 0, 1);
+      ledR = 1;
+      ledG = 0;
+      ledB = 1;
+      //setColor(1, 0, 1);
       break;
 
     case blauw:
-      setColor(1, 1, 0);
+      ledR = 1;
+      ledG = 1;
+      ledB = 0;
+      //setColor(1, 1, 0);
       break;
 
     case geel:
-      setColor(0, 0, 1);
+      ledR = 0;
+      ledG = 0;
+      ledB = 1;
+      //setColor(0, 0, 1);
       break;   
 
     case cyaan:
-      setColor(1, 0, 0);
+      ledR = 1;
+      ledG = 0;
+      ledB = 0;
+      //setColor(1, 0, 0);
       break;
 
     case paars:
-      setColor(0, 1, 0);
+      ledR = 0;
+      ledG = 1;
+      ledB = 0;
+      //setColor(0, 1, 0);
       break;
 
     case wit:
-      setColor(0, 0, 0);
+      ledR = 0;
+      ledG = 0;
+      ledB = 0;
+      //setColor(0, 0, 0);
       break; 
-
-    case knipperen: 
-      setColor(0, 0, 0);
-      delay(200);
-      setColor(1, 1, 1);
-      delay(200);
-      setColor(0, 0, 0);
-      delay(200);
-      setColor(1, 1, 1);
-      delay(200);
-      setColor(0, 0, 0);
-      delay(200);
-      setColor(1, 1, 1);
-      delay(200);
-      setColor(0, 0, 0);
   }
+  ledKnipper = knipper;
+  kleurupdate = true;
 }
 
-void checkStatus(uint8_t status) {
+void displayStatus(uint8_t status) {
   switch (status) {
-    case depot_selectie: rgbLED(rood); break;
-    case klaar_voor_start: rgbLED(groen); break;
-    case onderweg_naar_depot: rgbLED(blauw); break;
-    case wachten_op_pakket: rgbLED(geel); break;
-    case onderweg_naar_eindpunt: rgbLED(cyaan); break;
-    case vrij_rijden: rgbLED(paars); break;
-    case op_eindpunt: rgbLED(wit); break;
-    case wacht_met_wegrijden: rgbLED(knipperen); break;
+    // case depot_selectie: rgbLED(rood, 0); break;
+    case klaar_voor_start: rgbLED(groen, 2); break;
+    case onderweg_naar_depot: rgbLED(blauw, 0); break;
+    //case wachten_op_pakket: rgbLED(geel, 0); break;
+    case onderweg_naar_eindpunt: rgbLED(cyaan, 0); break;
+    case vrij_rijden: rgbLED(paars, 0); break;
+    case op_eindpunt: rgbLED(wit, 0); break;
+    case wacht_met_wegrijden: rgbLED(geel, 2); break;
   }
 }
 
-void RGBRouteSelecter(byte gekozenGang) {
-
-}
-
-bool checkNoodKnop() {
-  if (noodStopActief) {
-    noodStopActief = false;
-
-    digitalWrite(in1, LOW); digitalWrite(in2, LOW);
-    digitalWrite(in3, LOW); digitalWrite(in4, LOW);
-
-    huidigeStatus = klaar_voor_start;
-    return true;
-  }
-  return false;
-}
-
+//------------------------- SAFETY FUNCTIONS ----------------------------------------------------
 bool safetyDelay(unsigned long ms) {
   unsigned long startTijd = millis();
   while (millis() - startTijd < ms) {
@@ -268,14 +286,16 @@ bool safetyDelay(unsigned long ms) {
 }
 
 void achteruitInterupt() {
-  forward(ForewardRijsnelheid);
+  forward(ForwardRijsnelheid);
 }
 
 void stopButtonInterupt() {
   stopMotors();
+  huidigeStatus = klaar_voor_start;
   // uitendeijlk de stopped state hier
 }
 
+//----------------------- PING RELATED FUNCTIONS -------------------------------------------------
 // MAD filter function
 float filtered_average_mad(float *readings) {
     // Sort a copy to find median
@@ -327,15 +347,15 @@ float filtered_average_mad(float *readings) {
             sum += readings[i];
             valid_count++;
         } else {
-            Serial.print("Excluded value: ");
-            Serial.println(readings[i]);
+            // Serial.print("Excluded value: ");
+            // Serial.println(readings[i]);
         }
     }
     
     return (valid_count > 0) ? sum / valid_count : median;
 }
 
-// Updated ping function that updates both sensors
+// Updated ping function that updates both ultrasonic sensors
 void ping(){
   if (nu > wachtPingL && PingAanDeBeurt == links) {
     float readingsL[NUM_READINGS];
@@ -354,7 +374,7 @@ void ping(){
       }
     }
 
-    distanceL = (validReadingsL >= 4) ? filtered_average_mad(readingsL) : -1;
+    distanceL = (validReadingsL >= 2) ? filtered_average_mad(readingsL) : -1;
 
     wachtPingR = nu + pingDelay;
     PingAanDeBeurt = rechts;
@@ -376,17 +396,19 @@ void ping(){
       }
     }
 
-    distanceR = (validReadingsR >= 4) ? filtered_average_mad(readingsR) : -1;
+    distanceR = (validReadingsR >= 2) ? filtered_average_mad(readingsR) : -1;
 
     wachtPingL = nu + pingDelay;
     PingAanDeBeurt = links;
   }
-  Serial.print("links: ");
-  Serial.print(distanceL);
-  Serial.print(" rechts: ");
-  Serial.println(distanceR);
+  // Serial.print("links: ");
+  // Serial.print(distanceL);
+  // Serial.print(" rechts: ");
+  // Serial.println(distanceR);
 }
 
+// --------------------------- APM ROUTE RELATED FUNCTIONS ---------------------------------------
+// functie om RFID tag te lezen
 byte leesRFIDGetal() {
   if (!mfrc522.PICC_IsNewCardPresent()) return 0;
   if (!mfrc522.PICC_ReadCardSerial()) return 0;
@@ -405,8 +427,8 @@ byte leesRFIDGetal() {
   byte b0 = buffer[0];
   byte b1 = buffer[1];
 
-  // Tweetallig: "10"-"14"
-  if (b0 == 0x31 && b1 >= 0x30 && b1 <= 0x34) {
+  // Tweetallig: "10"-"15"
+  if (b0 == 0x31 && b1 >= 0x30 && b1 <= 0x35) {
     return 10 + (b1 - 0x30);
   }
 
@@ -418,120 +440,186 @@ byte leesRFIDGetal() {
   return 0;
 }
 
-byte selectRoute() {
-  bool selectieNu = digitalRead(route_selectie);
+// LED kleur afhankelijk van de gekozen gang in selectRoute
+void RGBRouteSelecter(byte gekozenGang) {
+  switch (gekozenGang) {
+    case 2:
+      rgbLED(rood, 1);
+    break;
 
-  if (selectieNu == LOW && laatsteSelectieStatus == HIGH) {
-    if (knopTeller == 0) knopStartTijd = nu;
-    knopTeller++;
-  }
-  laatsteSelectieStatus = selectieNu;
+    case 3:
+      rgbLED(groen, 1);
+    break;
 
-  if (knopTeller > 0 && nu - knopStartTijd > knopTimeout) {
-    byte gang = knopTeller + 1; // 1x = gang 2, 2x = gang 3 enz.
+    case 4:
+      rgbLED(blauw, 1);
+    break;   
 
-    if (gang < 2 || gang > 7) {
-      knopTeller = 0;
-      return 0;
-    }
+    case 5:
+      rgbLED(geel, 1);
+    break;
 
-    knopTeller = 0;
-    return gang;
-  }
-
-  return 0;
+    case 6:
+      rgbLED(cyaan, 1);
+    break;
+      
+    case 7:
+      rgbLED(paars, 1);
+    break;      
+  }   
 }
 
+// leest de RFID tag en voert iets uit adhv het nummer
 void rfidCheck() {
   byte rfidGang = leesRFIDGetal();
-  if (rfidGang == 0) return;
 
-  stopMotors();
+  Serial.println(rfidGang);
+  
+  // geen gang/geen tag
+  if (rfidGang == 0)
+    return;
 
-  if (rfidGang == gekozenGang) {
+  stopMotors(); // stopt om de tag te lezen
+  
+  //eerste tag, na het vrij rijden stukje
+  if (rfidGang == 1) {
+    huidigeStatus = depot_selectie;
+    return;
+  }
+  // eind punt
+  else if (rfidGang == 15) {
     stopMotors();
-
+    huidigeStatus = op_eindpunt;
+    return;
+  }
+  //vergelijkt gelezen gang van de tag met de gekozenroute
+  else if (rfidGang == gekozenGang) {
+    stopMotors();
+    gangGevonden = true;
+    left(ForwardRijsnelheid);
+    delay(770); //delay van 770 zorgt voor ongeveer een draai van 90 graden
+    return;
+  }
+  else {
+    return;
   }
 }
 
-void handleStates(){
-    switch (huidigeStatus) {
+// ---------------------------- MAIN PROGRAM FUNCTIONS ---------------------------------------
 
+void handleStates(){
+  do { // do while dus loopt ten minste een keer en is loop zodat de veranderde status gelijk gerund wordt
+    statusVeranderd = false; // zet op false om de repeating loop niet oneindig door te laten gaan
+    
+    switch (huidigeStatus) { // de main switch case
+      //------------------ klaar voor start state -------------------------
       case klaar_voor_start:
-        if ((digitalRead(start_knop))
+        if (digitalRead(start_knop) == LOW) { // check de startknop
           huidigeStatus = vrij_rijden;
           statusVeranderd = true;
         }
-        else if (selectieIngedrukt){
+        else if (ReadSelectButton()) { // check de selectie knop
+          huidigeStatus = depot_selectie;
+          RGBRouteSelecter(gekozenGang);
+          statusVeranderd = true;
+        }
+        break;
+
+      case vrij_rijden:
+        gekozenGang = 1;
+        gangGevonden = false;
+        lijnDetectie();
+        rfidCheck();
+
+        if(gangGevonden) {
+          stopMotors();
           huidigeStatus = depot_selectie;
           statusVeranderd = true;
         }
-      break;
+        break;
 
+      // ------------------ depot slectie state -------------------------
       case depot_selectie:
-        if (statusVeranderd){
-          serialLedControl(gekozenGang);
-        }
-
-        else if (selectieIngedrukt){
+        if (ReadSelectButton()) { // schakel door de te kiezen depot tags (2-7)
           if (gekozenGang < 7){
             gekozenGang++;
           }
           else {
             gekozenGang = 2;
           }
+          RGBRouteSelecter(gekozenGang);
         }
-        else if (startIngedrukt){
+        
+        else if (digitalRead(start_knop) == LOW){ // start reis naar depot
           huidigeStatus = onderweg_naar_depot;
           statusVeranderd = true;
         }
-      break;
+        break;
 
+      // ----------------- onderweg naar depot state ------------------
       case onderweg_naar_depot:
-       if (depotBereikt){
-      huidigeStatus = wachten_op_pakket;
-      statusVeranderd = true;
-      break;
-      
-      case wachten_op_pakket:
-        if (pakketIngedrukt){
-          huidigeStatus = wacht_met_wegrijden;
-          statusVeranderd = true;
-        }
-      break;
-
-      case wacht_met_wegrijden:
-        if (pakketNu) {
-          if (startIngedrukt){
-            huidigeStatus = onderweg_naar_eindpunt;
+        lijnDetectie();
+        rfidCheck();
+        if (gangGevonden) {
+          // als tag 2-7 is gevonden, opzoek naar corresponderende tag 8-13
+          if (!depotGevonden) {
+            gangGevonden = false;
+            gekozenGang += 6;
+            depotGevonden = true;
+          } 
+          // tag 8-13 gevonden
+          else { 
+            gangGevonden = false;
+            depotGevonden = false;
+            huidigeStatus = wachten_op_pakket;
+            stopMotors();
             statusVeranderd = true;
           }
         }
-        else {
-          huidigeStatus = wachten_op_pakket;
+        
+        break;
+      // ----------------- WACHTEN OP PAT STATE ---------------------------
+      case wachten_op_pakket:
+        if (digitalRead(pakket_detectie) == LOW) {
+          rgbLED(geel, 2);
+        } else {
+          rgbLED(geel, 0);
+        }
+
+        if (digitalRead(start_knop) == LOW) {
+          huidigeStatus = onderweg_naar_eindpunt;
           statusVeranderd = true;
         }
-      break;
-
+        break;
+        
+      // ----------------- RIJDEN NAAR EINDPUNT STATE ----------------------
       case onderweg_naar_eindpunt:
-      // code hier
-      statusVeranderd = true;
-      break;
+        gekozenGang = 15;
+        lijnDetectie();
+        rfidCheck();
 
+        if (gangGevonden) {
+          stopMotors();
+          huidigeStatus = op_eindpunt;
+          statusVeranderd = true;
+        }
+        break;
+
+      // ------------------ OP EINDPUNT ----------------------------------
       case op_eindpunt:
-      if (bestemminBereikt){
-        huidigeStatus = vrij_rijden 
-      statusVeranderd = true;
-      break;
+        stopMotors();
+        break;
+    }
 
-      case vrij_rijden:
-      // code hier
-      statusVeranderd = true;
-      break;
-
-  }
+    if (statusVeranderd) {statusVerandertUpdate();} 
+  } while (statusVeranderd);
 }
 
+void statusVerandertUpdate(){
+  displayStatus(huidigeStatus);
+}
+
+// zwarte lijndetectie door ir_sensors
 void lijnDetectie() {
   ping();
 
@@ -539,33 +627,76 @@ void lijnDetectie() {
   bool linksSensorIR = digitalRead(IR_links);
   bool achterSensorIR = digitalRead(IR_achter);
 
-  if (rechtsSensorIR && nu - laatsteHitTijd > debounceDelay) {
+  if (rechtsSensorIR && nu - laatsteHitTijd > obstakelDebounceDelay) {
     laatsteHitTijd = nu;
 
-    if (!achterSensorIR) backwards(ReverseRijsnelheid);
+    backwards(ReverseRijsnelheid);
 
-    safetyDelay(500);
-    left(ForewardRijsnelheid);
-    safetyDelay(200);
+    safetyDelay(600);
+    left(ForwardRijsnelheid);
+    safetyDelay(300);
 
-  } else if (linksSensorIR && nu - laatsteHitTijd > debounceDelay) {
+  } else if (linksSensorIR && nu - laatsteHitTijd > obstakelDebounceDelay) {
     laatsteHitTijd = nu;
 
-    if (!achterSensorIR) backwards(ReverseRijsnelheid);
+    backwards(ReverseRijsnelheid);
 
-    safetyDelay(500);
-    right(ForewardRijsnelheid);
-    safetyDelay(200);
+    safetyDelay(600);
+    right(ForwardRijsnelheid);
+    safetyDelay(300);
     
   } else if (distanceL < 20 && distanceL > 0){ 
-    right(ForewardRijsnelheid);
+    right(ForwardRijsnelheid);
 
   } else if (distanceR < 20 && distanceR > 0){
-    left(ForewardRijsnelheid);
+    left(ForwardRijsnelheid);
 
   } else {
-      forward(ForewardRijsnelheid);
+      forward(ForwardRijsnelheid);
   }
+}
+
+// ISR functie voor noodstop knop, deze code draait als de knop wordt ingedrukt
+void knopISR(){
+  unsigned long nu = millis();
+
+  if(nu - noodStopTijd > noodDebounce){
+    noodStopActief = true;
+    noodStopTijd = nu;
+    
+    //stopMotors();
+    
+    // om het terug te zetten op de state klaar_voor_start, moet je dat in loop zetten m
+    huidigeStatus = NOODSTOP_PAUZE;
+  }
+}
+// ISR funcite tegen het achterover kuukelen van de APM van randjes af
+void sensorISR(){
+  unsigned long nu = millis();
+
+  if(nu - noodStopTijd > noodDebounce){
+    //noodStopActief = true;
+    noodStopTijd = nu;
+    
+    //forward(ForwardRijsnelheid);   
+  }
+}
+
+// geeft aan de status van de knop 
+bool ReadSelectButton() {
+  if (selectieDebounceTime < nu){
+    selectieIngedrukt = !digitalRead(route_selectie);
+    if (selectieIngedrukt && laatsteSelectieStatus){
+      laatsteSelectieStatus = LOW;
+      selectieDebounceTime = nu + selectieDebounceDelay;
+      return true;
+    }
+    else if (!selectieIngedrukt && !laatsteSelectieStatus){
+      laatsteSelectieStatus = HIGH;
+      selectieDebounceTime = nu + selectieDebounceDelay;
+    }
+  }
+  return false;
 }
 
 void setup() {
@@ -606,11 +737,32 @@ void setup() {
   pinMode(echoPinR, INPUT);
 
   // interupts
-  attachInterrupt(digitalPinToInterrupt(21), achteruitInterupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(21), sensorISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(20), knopISR, FALLING);
+
+  displayStatus(huidigeStatus);
+  // Serial.println("APM gestart");
+  // Serial.print("huidige status: ");
+  // Serial.println(huidigeStatus);
 }
 
 void loop() {
   nu = millis();
-  lijnDetectie();
-  ping();
+  updateColor();
+  
+  if (noodStopActief){
+    stopMotors();
+    if (digitalRead(start_knop) == LOW) {
+      noodStopActief = false;
+      huidigeStatus = klaar_voor_start;
+      displayStatus(klaar_voor_start);
+    }
+  }
+  else if (forwardsOveride){
+    forward(ForwardRijsnelheid);
+    delay(200);
+  }
+  else {
+    handleStates();
+  }
 }
